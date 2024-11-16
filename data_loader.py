@@ -1,8 +1,12 @@
 import re
-
+import os
 import numpy as np
 import torch
 from torch.autograd import Variable
+import json
+from transformers import BertTokenizer
+from sklearn.model_selection import train_test_split
+import random
 
 
 def _truncate_seq_pair(tokens_a, tokens_b, max_length):
@@ -311,6 +315,88 @@ def tok2int_list(src_list, tokenizer, max_seq_length, max_seq_size=-1):
         msk_padding += ([[0] * max_seq_length] * (max_seq_size - len(msk_padding)))
         seg_padding += ([[0] * max_seq_length] * (max_seq_size - len(seg_padding)))
     return inp_padding, msk_padding, seg_padding
+
+
+class NewsDataset(torch.utils.data.Dataset):
+    ''' For data iteration '''
+    def __init__(self, filenames, root_dir, tokenizer, max_len=130):
+        self.filenames = filenames
+        self.root_dir = root_dir
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        
+        # Load labels
+        self.labels = torch.load(os.path.join(root_dir, 'raw', 'politifact_labels.pt'))
+    
+    def __len__(self):
+        return len(self.filenames)
+    
+    def __getitem__(self, idx):
+        filename = self.filenames[idx]
+        
+        # Load article data
+        with open(os.path.join(self.root_dir, 'raw', filename), 'r', encoding='utf-8') as f:
+            article = json.load(f)
+        
+        # Get text and label
+        claim = article['claim']
+        evidence = article['evidence'][0]  # Use first evidence
+        label = self.labels[filename]
+        
+        # Tokenize
+        encoded = self.tokenizer(
+            claim,
+            evidence,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_len,
+            return_tensors='pt'
+        )
+        
+        # Convert to tensors
+        input_ids = encoded['input_ids'].squeeze(0)
+        attention_mask = encoded['attention_mask'].squeeze(0)
+        token_type_ids = encoded['token_type_ids'].squeeze(0)
+        label = torch.tensor(label, dtype=torch.long)
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'token_type_ids': token_type_ids,
+            'label': label
+        }
+
+def get_train_test_split(args):
+    """Get train and test filenames with stratified split."""
+    labels_d = torch.load(os.path.join(args.root, 'raw', f"{args.dataset}_labels.pt"))
+
+    filenames_real = [x for x, y in labels_d.items() if y == 0]
+    filenames_fake = [x for x, y in labels_d.items() if y == 1]
+
+    random.shuffle(filenames_real)
+    random.shuffle(filenames_fake)
+
+    n_train_real = int(len(filenames_real) * (1-args.test_size))
+    n_train_fake = int(len(filenames_fake) * (1-args.test_size))
+
+    # Note: split should be fixed
+    filenames_train = filenames_real[:n_train_real] + filenames_fake[:n_train_fake]
+    filenames_test = filenames_real[n_train_real:] + filenames_fake[n_train_fake:]
+    return filenames_train, filenames_test
+
+def get_datasets(args):
+    """Create train and test datasets"""
+    # Get train/test split
+    filenames_train, filenames_test = get_train_test_split(args)
+    
+    # Initialize tokenizer
+    tokenizer = BertTokenizer.from_pretrained(args.bert_pretrain)
+    
+    # Create datasets
+    train_dataset = NewsDataset(filenames_train, args.root, tokenizer, max_len=args.max_len)
+    test_dataset = NewsDataset(filenames_test, args.root, tokenizer, max_len=args.max_len)
+    
+    return train_dataset, test_dataset
 
 
 class DataLoader(object):

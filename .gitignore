@@ -1,0 +1,62 @@
+# Python virtual environment
+venv/
+env/
+ENV/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Large model files and datasets
+*.pt
+*.pth
+*.h5
+*.ckpt
+*.bin
+*.model
+*.pkl
+*.joblib
+
+# Logs and temporary files
+logs/
+*.log
+temp/
+tmp/
+
+# Local development settings
+.env
+.env.*
+
+# Dataset files (these will be generated in Colab)
+data/processed/
+data/raw/
+*.csv
+*.json
+*.jsonl
+*.tsv
+*.txt
+!requirements.txt
+!README.txt
+
+# Model specific
+wandb/
+runs/
+outputs/
+checkpoints/

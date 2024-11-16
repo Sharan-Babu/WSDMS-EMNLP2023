@@ -14,16 +14,18 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from transformers import BertTokenizer, get_linear_schedule_with_warmup
 from transformers.optimization import AdamW
 
 sys.path.append("..")
 
-from HotCakeModels import inference_model
+from HotCakeModels import HotCakeForSequenceClassification
 from bert_model import BertForSequenceEncoder
 from analysis_results import analyze_results
 from utils.utils_misc import get_eval_report, print_results, set_args_from_config, save_results_to_tsv
 from utils.utils_preprocess import get_train_test_readers, getanchorinfo
+from data_loader import get_datasets
 
 logger = logging.getLogger(__name__)
 
@@ -93,118 +95,97 @@ def eval_model(model, validset_reader, results_eval=None, args=None, epoch=0, wr
 
 
 
-def train_model(model, args, trainset_reader, validset_reader, writer, experiment_name):
-    save_path = args.outdir + '/model'
+def train_model(model, args, train_loader, test_loader, writer, experiment_name):
+    # Calculate total training steps
+    total_steps = len(train_loader) * args.num_train_epochs
+    
+    # Initialize optimizer and scheduler
+    optimizer = AdamW(model.parameters(), lr=float(args.learning_rate))
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * args.warmup_proportion),
+        num_training_steps=total_steps
+    )
+    
+    # Initialize training variables
     best_accuracy = 0.0
-    running_loss = 0.0
-    t_total = int(trainset_reader.total_num / args.train_batch_size / args.gradient_accumulation_steps * args.num_train_epochs)
-
-    # initialize parameters
-    param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {
-            'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
-            'weight_decay': 0.01
-        },
-        {
-            'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
-            'weight_decay': 0.0
-        }
-    ]
-    optimizer = Adam(optimizer_grouped_parameters,
-                      lr=args.learning_rate)
-
-    # warmup step
-    args.warmup_steps = math.ceil(t_total * args.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps,
-                                                num_training_steps=t_total)
-
+    best_epoch = 0
     global_step = 0
-
-    # Initialize analysis tools
-
-    # Summarize results
-    counters_test = [Counter(), Counter(), Counter(), Counter()]
-    counters_train = [Counter(), Counter(), Counter(), Counter()]
-
-    # store results to dict
-    results_train, results_eval = {}, {}
-
-    device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else 'cpu')
-    model.to(device)
-
-    # start training
-    tr_loss, logging_loss = 0.0, 0.0
+    tr_loss = 0.0
+    
+    # Training loop
     for epoch in range(int(args.num_train_epochs)):
         model.train()
-        optimizer.zero_grad()
-        preds_all, labs_all, filenames_train_all = [], [], []
-
-        labels_count = Counter(trainset_reader.labels)
-
-        for index, data in enumerate(trainset_reader):
-
-            inputs, lab_tensor, filenames_train, aux_info = data
-            prob = model(inputs, aux_info)
-
-            loss = F.nll_loss(prob, lab_tensor.to(device))
-
-            preds_all += prob.max(1)[1].tolist()
-
-            labs_all += lab_tensor.tolist()
-            filenames_train_all += filenames_train
-
-            running_loss += loss.item()
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+        epoch_loss = 0.0
+        
+        for step, batch in enumerate(train_loader):
+            # Forward pass
+            outputs = model(batch, None)
+            loss = F.nll_loss(outputs, batch['label'])
+            
+            # Backward pass
+            loss = loss / args.gradient_accumulation_steps
             loss.backward()
-
-            global_step += 1
-            tr_loss += loss.item()
-            if global_step % args.gradient_accumulation_steps == 0:
-                optimizer.step()  
+            epoch_loss += loss.item()
+            
+            if (step + 1) % args.gradient_accumulation_steps == 0:
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-
-                logger.info('Epoch: {0}, Step: {1}, Loss: {2}'.format(epoch, global_step, (running_loss / global_step)))
-                if writer is not None:
-                    writer.add_scalar('lr', scheduler.get_last_lr()[0], global_step)
-                    writer.add_scalar("Loss/train", (tr_loss - logging_loss) / args.logging_steps, global_step)
-                    logging_loss = tr_loss
-
-        # start eval
-        logger.info('Start eval!')
-        analyze_results(labs_all, preds_all, counters_train, filenames_train_all, epoch, args)
+                global_step += 1
+                
+                if writer:
+                    writer.add_scalar('train/loss', epoch_loss, global_step)
+        
+        # Evaluation
+        model.eval()
+        eval_loss = 0.0
+        eval_accuracy = 0.0
+        eval_steps = 0
+        
         with torch.no_grad():
-            dev_accuracy = eval_model(model, validset_reader, results_eval=results_eval, args=args, epoch=epoch, counters_test=counters_test)
-            logger.info('Dev acc: {0}'.format(dev_accuracy))
-            if dev_accuracy > best_accuracy:
-                best_accuracy = dev_accuracy
-                if not osp.exists(save_path):
-                    os.mkdir(save_path)
-
-                torch.save({
-                    'epoch': epoch,
-                    'model': model.state_dict(),
-                    'best_accuracy': best_accuracy
-                }, f"{save_path}/{experiment_name}.pt")
-                logger.info("Saved best epoch {0}, best accuracy {1}".format(epoch, best_accuracy))
-            if (epoch + 1) % 10 == 0:
-                if not osp.exists(osp.join("..", "logs", "stats")):
-                    os.mkdir(osp.join("..", "logs", "stats"))
-                torch.save((counters_train, counters_test),
-                           osp.join("..", "logs", "stats", f"{args.prefix}{args.sample_suffix}_{epoch + 1}.pt"))
-                save_results_to_tsv(results_train, results_eval, experiment_name, args)
-        # ------------------------------------------
-        # Get eval results
-        # ------------------------------------------
-        preds_all = np.hstack(preds_all)
-        labs_all = np.hstack(labs_all)
-        results = get_eval_report(labs_all, preds_all)
-        results_train[epoch] = results
-        print_results(results, epoch, args=args, dataset_split_name="Train")
-
+            for batch in test_loader:
+                outputs = model(batch, None)
+                tmp_eval_loss = F.nll_loss(outputs, batch['label'])
+                eval_loss += tmp_eval_loss.item()
+                
+                preds = outputs.argmax(dim=1)
+                eval_accuracy += (preds == batch['label']).float().mean().item()
+                eval_steps += 1
+        
+        eval_loss = eval_loss / eval_steps
+        eval_accuracy = eval_accuracy / eval_steps
+        
+        if writer:
+            writer.add_scalar('eval/loss', eval_loss, epoch)
+            writer.add_scalar('eval/accuracy', eval_accuracy, epoch)
+        
+        logger.info(f'Epoch {epoch+1}/{args.num_train_epochs}')
+        logger.info(f'Average loss: {epoch_loss:.4f}')
+        logger.info(f'Eval loss: {eval_loss:.4f}')
+        logger.info(f'Eval accuracy: {eval_accuracy:.4f}')
+        
+        # Save best model
+        if eval_accuracy > best_accuracy:
+            best_accuracy = eval_accuracy
+            best_epoch = epoch
+            
+            # Save model
+            if not os.path.exists(args.outdir):
+                os.makedirs(args.outdir)
+            
+            model_path = os.path.join(args.outdir, f'best_model_{experiment_name}.pt')
+            torch.save(model.state_dict(), model_path)
+            
+            logger.info(f'New best accuracy: {best_accuracy:.4f}')
+            logger.info(f'Saved model to {model_path}')
+        
+        # Early stopping
+        if epoch - best_epoch >= args.patience:
+            logger.info(f'Early stopping triggered. Best accuracy: {best_accuracy:.4f} at epoch {best_epoch}')
+            break
+    
+    return best_accuracy
 
 
 if __name__ == "__main__":
@@ -243,14 +224,27 @@ if __name__ == "__main__":
 
     parser.add_argument('--debug', action='store_true', help='Debug')
 
+    parser.add_argument("--mode", type=str, default="HotCake", help="Model mode: HotCake, HotCake-SW, or HotCake-FC")
+    parser.add_argument("--sample_suffix", type=str, default="", help="Suffix for sample identification")
+    parser.add_argument("--sigma", type=float, default=1.0, help="Sigma value for kernel")
+    parser.add_argument("--dataset", type=str, default="politifact", help="Dataset to use: politifact, gossipcop, or buzznews")
     parser.add_argument('--config_file', type=str, required=True)
+    parser.add_argument("--train_batch_size", type=int, default=8, help="Training batch size")
+    parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs")
+    parser.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Number of gradient accumulation steps")
+    parser.add_argument("--test_size", type=float, default=0.2, help="Test set size ratio")
+    parser.add_argument("--valid_batch_size", type=int, default=8, help="Validation batch size")
+    parser.add_argument("--max_len", type=int, default=512, help="Maximum sequence length")
+    parser.add_argument("--enable_tensorboard", action="store_true", help="Enable TensorBoard logging")
+    parser.add_argument("--bert_pretrain", type=str, default="bert-base-cased", help="Pretrained BERT model to use")
+
     args = parser.parse_args()
 
     # Set random seed
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.cuda.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = True
 
@@ -294,40 +288,41 @@ if __name__ == "__main__":
     logger.info(f'{args.dataset} Start training!')
     logger.info(f'Using batch size {args.train_batch_size} | accumulation {args.gradient_accumulation_steps}')
 
+    tokenizer = BertTokenizer.from_pretrained(args.bert_pretrain, do_lower_case=False)
     label_map = {
         'real': 0,
         'fake': 1
     }
-    tokenizer = BertTokenizer.from_pretrained(args.bert_pretrain, do_lower_case=False)
-
-    trainset_reader, validset_reader = get_train_test_readers(label_map, tokenizer, args)
-
-    # --------------------------------
-    # Loading BERT model
-    # ---------------------------------
-
-    logger.info('Initializing BERT model')
-    bert_model = BertForSequenceEncoder.from_pretrained(args.bert_pretrain)
+    train_dataset, test_dataset = get_datasets(args)
     
-    # -----------------------------------
-    # Visualize model
-    # -----------------------------------
-
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.valid_batch_size,
+        shuffle=False
+    )
+    
+    # Initialize model
+    logger.info("Initializing BERT model")
+    model = HotCakeForSequenceClassification.from_pretrained(args.bert_pretrain)
+    
+    # Initialize optimizer
+    optimizer = AdamW(model.parameters(), lr=float(args.learning_rate))
+    
+    # Initialize tensorboard
     if args.enable_tensorboard:
-        from torch.utils.tensorboard import SummaryWriter
-
         logger.info("Initializing Tensorboard")
-        writer = SummaryWriter()
-        vis_data = trainset_reader.next()
-        writer.add_graph(model.device, (vis_data[0], vis_data[2], None))
-        writer.flush()
+        from torch.utils.tensorboard import SummaryWriter
+        writer = SummaryWriter(f'runs/{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
     else:
         writer = None
-    model = inference_model(bert_model, args, config, tokenizer=tokenizer)
-    if args.cuda:
-
-        model = nn.DataParallel(model)
-        model = model.cuda()
-
-    train_model(model, args, trainset_reader, validset_reader, writer=writer,
-                experiment_name=experiment_name)
+    
+    # Train the model
+    best_accuracy = train_model(model, args, train_loader, test_loader, writer, "politifact")
+    
+    logger.info(f"Best accuracy: {best_accuracy}")
